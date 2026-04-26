@@ -1,0 +1,513 @@
+---
+title: "Practical Homework-2"
+author: "Sravya Murala"
+date: "2026-04-25"
+output: html_document
+---
+
+## Introduction
+
+This homework is worked at predicting whether a person has ever been diagnosed with cancer using their demographics and lifestyle behaviors. The data is from the 2022 National Health Interview Survey (NHIS), accessed through IPUMS Health Surveys. I tune three SVM kernels the linear, radial, and polynomial using 5-fold cross-validation, then compare them on a held-out test set. The goal is to see whether non-linear kernels capture more signal than a simple linear one, and to identify which variables matter most for cancer prediction.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(e1071)
+library(caret)
+library(dplyr)
+library(pROC)
+library(ggplot2)
+library(gridExtra)
+library(magrittr)
+library(kernlab)
+# Parallel processing to use multiple CPU cores
+library(doParallel)
+cl <- makePSOCKcluster(parallel::detectCores() - 1)  # use all cores except 1
+registerDoParallel(cl)
+```
+
+#### Loading and Data Inspection
+
+```{r}
+# Loading the Data
+nhis_df <- read.csv("/Users/sravyaaas/Documents/SML-2/practical homework-2/nhis_2022.csv")
+
+# Checking dimensions and structure
+dim(nhis_df)
+glimpse(nhis_df)
+```
+
+```{r}
+table(nhis_df$CANCEREV, useNA = "ifany")
+```
+
+```{r}
+# selecting Variables, confirming variables planned to use as predictors
+my_vars <- c("AGE", "SEX", "POVERTY", "BMICALC",
+             "MOD10DMIN", "HRSLEEP", "ALCDAYSYR", "FRUTNO")
+
+all(my_vars %in% names(nhis_df))
+
+summary(nhis_df[, my_vars])
+```
+
+#### Data Cleaning
+
+The NHIS uses sentinel codes 996, 997, 998, 999, etc. for missing,refused, or "Not in Universe" responses. These must be converted to NA before modeling, otherwise the SVM will treat "999" as a real value.
+
+```{r}
+# Filtering adults
+nhis_clean <- subset(nhis_df, is.element(CANCEREV, c(1, 2)) & AGE >= 18 & AGE <= 85)
+dim(nhis_clean)
+```
+
+```{r}
+# Recoding target
+nhis_clean$CANCEREV <- factor(ifelse(nhis_clean$CANCEREV == 2, "Yes", "No"),
+                              levels = c("No", "Yes"))
+table(nhis_clean$CANCEREV)
+prop.table(table(nhis_clean$CANCEREV))
+```
+
+```{r}
+# Recoding and dropping missing values
+# Keeping only columns needed for modeling
+cols <- c("CANCEREV", "AGE", "SEX", "POVERTY", "BMICALC",
+               "MOD10DMIN", "HRSLEEP", "ALCDAYSYR", "FRUTNO")
+nhis_clean <- nhis_clean[, cols]
+```
+
+```{r}
+# Converting to a factor as SVM treats numeric 1/2 as ordered which is wrong
+nhis_clean$SEX[is.element(nhis_clean$SEX, c(7, 8, 9))] <- NA
+nhis_clean$SEX <- factor(ifelse(nhis_clean$SEX == 1, "Male", "Female"),
+                         levels = c("Male", "Female"))
+```
+
+```{r}
+# 98 = Undefinable, 99 = Unknown -> NA
+nhis_clean$POVERTY[is.element(nhis_clean$POVERTY, c(98, 99))] <- NA
+nhis_clean$BMICALC[nhis_clean$BMICALC == 0 | nhis_clean$BMICALC >= 99] <- NA
+nhis_clean$MOD10DMIN[nhis_clean$MOD10DMIN >= 996] <- NA
+
+nhis_clean$HRSLEEP[nhis_clean$HRSLEEP == 25] <- 0.5
+nhis_clean$HRSLEEP[is.element(nhis_clean$HRSLEEP, c(0, 97, 98, 99))] <- NA
+
+nhis_clean$ALCDAYSYR[nhis_clean$ALCDAYSYR >= 995] <- NA
+
+nhis_clean$FRUTNO[nhis_clean$FRUTNO >= 995] <- NA
+```
+
+
+```{r}
+# Dropping rows with NAs in any predictor
+nhis_clean <- na.omit(nhis_clean)
+
+# Verify the cleaned data
+dim(nhis_clean)
+summary(nhis_clean)
+```
+
+```{r}
+# checking for class balance 
+table(nhis_clean$CANCEREV)
+round(prop.table(table(nhis_clean$CANCEREV)) * 100, 2)
+```
+
+###  Exploratory Data Analysis
+
+Before modeling, Its important that we look at how the target relates to a few key predictors. This helps confirm that the cleaned data behaves the way we would expect and gives a sense of which variables might carry signal.
+
+```{r eda-plots, fig.width=12, fig.height=4}
+# Age by cancer status 
+p1 <- ggplot(nhis_clean, aes(x = CANCEREV, y = AGE, fill = CANCEREV)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_fill_manual(values = c("No" = "#1f77b4", "Yes" = "#d62728")) +
+  labs(title = "Age by Cancer Status", x = "Ever Had Cancer", y = "Age (years)") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+# BMI by cancer status
+p2 <- ggplot(nhis_clean, aes(x = CANCEREV, y = BMICALC, fill = CANCEREV)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_fill_manual(values = c("No" = "#1f77b4", "Yes" = "#d62728")) +
+  labs(title = "BMI by Cancer Status", x = "Ever Had Cancer", y = "BMI") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+# Cancer rate by sex
+sex_summary <- aggregate(rep(1, nrow(nhis_clean)),
+                         by = list(SEX = nhis_clean$SEX,
+                                   CANCEREV = nhis_clean$CANCEREV),
+                         FUN = sum)
+names(sex_summary)[3] <- "n"
+sex_summary$prop <- ave(sex_summary$n, sex_summary$SEX, FUN = function(x) x / sum(x))
+
+p3 <- ggplot(sex_summary, aes(x = SEX, y = prop, fill = CANCEREV)) +
+  geom_col(position = "dodge", alpha = 0.85) +
+  scale_fill_manual(values = c("No" = "#1f77b4", "Yes" = "#d62728")) +
+  labs(title = "Cancer Rate by Sex", x = "Sex", y = "Proportion", fill = "Cancer") +
+  theme_minimal(base_size = 12)
+
+gridExtra::grid.arrange(p1, p2, p3, nrow = 1)
+
+```
+
+#### Data preparation
+
+```{r}
+# Set seed for reproducibility 
+set.seed(2025)
+
+# Stratified subsample
+sample_strat <- caret::createDataPartition(nhis_clean$CANCEREV, 
+                                         p = 6000 / nrow(nhis_clean), 
+                                         list = FALSE)
+nhis_sample <- nhis_clean[sample_strat, ]
+
+# verifying sample size 
+dim(nhis_sample)
+round(prop.table(table(nhis_sample$CANCEREV)) * 100, 2)
+```
+
+```{r}
+# Splitting train and test
+train_lists <- caret::createDataPartition(nhis_sample$CANCEREV, 
+                                        p = 0.8, 
+                                        list = FALSE)
+train_df <- nhis_sample[train_lists, ]
+test_df  <- nhis_sample[-train_lists, ]
+
+# Checking sizes and class balance 
+cat("Train set:\n")
+dim(train_df)
+table(train_df$CANCEREV)
+
+cat("\nTest set:\n")
+dim(test_df)
+table(test_df$CANCEREV)
+```
+
+As we know SVMs are distance-based, so features on different scales would be unfair the AGE 0-85 would dominate HRSLEEP 1-24. So we scale to mean=0, sd=1. We compute scaling parameters on the TRAINING set only, then apply those same parameters to the test set to avoid any data leakage.
+
+```{r}
+# scaling numeric columns
+numeric_columns <- c("AGE", "POVERTY", "BMICALC", "MOD10DMIN", 
+                  "HRSLEEP", "ALCDAYSYR", "FRUTNO")
+
+# scaling values
+preprocessing <- caret::preProcess(train_df[, numeric_columns], 
+                             method = c("center", "scale"))
+
+train_df[, numeric_columns] <- predict(preprocessing, train_df[, numeric_columns])
+test_df[, numeric_columns]  <- predict(preprocessing, test_df[, numeric_columns])
+
+summary(train_df[, numeric_columns])
+```
+
+#### Cross validation
+
+```{r}
+# CV control
+cv_config <- caret::trainControl(method = "cv",
+                                 number = 5, 
+                                 classProbs = TRUE, 
+                                 summaryFunction = caret::twoClassSummary,
+                                 savePredictions = "final",
+                                 sampling = NULL) 
+```
+
+## Modeling
+
+I am tunining three SVM kernels separately using 5-fold cross-validation, scoring each by ROC-AUC because of the class imbalance of ~13% cancer. Each kernel has its own hyperparameter grid which the linear has just C, radial adds sigma, and polynomial adds degree and scale. Class weights are passed to the SVM to address the imbalance without resampling.
+
+#### Linear SVM Tuning
+
+```{r}
+# Linear kernal
+grid_linearSVM <- expand.grid(C = 10^seq(-2, 2, length.out = 9))
+
+# Class weights
+class_weights <- c(No = 1, Yes = sum(train_df$CANCEREV == "No") / sum(train_df$CANCEREV == "Yes"))
+
+set.seed(2025) 
+svm_linear <- caret::train(CANCEREV ~ ., 
+                           data          = train_df,
+                           method        = "svmLinear",
+                           trControl     = cv_config,
+                           tuneGrid      = grid_linearSVM,
+                           metric        = "ROC",
+                           class.weights = class_weights)
+
+cat("Best C for linear kernel:\n")
+print(svm_linear$bestTune)
+
+cat("\nFull CV results:\n")
+print(svm_linear$results)
+```
+
+#### RBF- Radial SVM Tuning
+
+```{r}
+# RBF adds sigma to tuning
+grid_radial <- expand.grid(C     = 10^seq(-1, 2, length.out = 5),
+                           sigma = 10^seq(-3, 0, length.out = 5))
+
+set.seed(2025) 
+svm_radial <- caret::train(CANCEREV ~ ., 
+                           data          = train_df,
+                           method        = "svmRadial",
+                           trControl     = cv_config,
+                           tuneGrid      = grid_radial,
+                           metric        = "ROC",
+                           class.weights = class_weights)
+
+cat("Best parameters for radial kernel:\n")
+print(svm_radial$bestTune)
+
+cat("\nFull CV results:\n")
+print(svm_radial$results)
+```
+
+#### Polynomial SVM Tuning
+
+```{r}
+# Polynomial kernal
+grid_poly <- expand.grid(C      = 10^seq(-1, 1, length.out = 3),
+                         degree = c(2, 3),
+                         scale  = c(0.01, 0.1, 1))
+
+set.seed(2025) 
+svm_poly <- caret::train(CANCEREV ~ ., 
+                         data          = train_df,
+                         method        = "svmPoly",
+                         trControl     = cv_config,
+                         tuneGrid      = grid_poly,
+                         metric        = "ROC",
+                         class.weights = class_weights)
+
+cat("Best parameters for polynomial kernel:\n")
+print(svm_poly$bestTune)
+
+cat("\nFull CV results:\n")
+print(svm_poly$results)
+```
+
+#### Evaluation
+
+```{r}
+evaluate_svm <- function(model, test_data, model_name) {
+  
+  # Getting predicted probabilities 
+  predicted_prob <- predict(model, test_data, type = "prob")[, "Yes"]
+  
+  # ROC and AUC 
+  roc_curve <- pROC::roc(response  = test_data$CANCEREV,
+                       predictor = predicted_prob,
+                       levels    = c("No", "Yes"),
+                       quiet     = TRUE)
+  auc_value <- as.numeric(pROC::auc(roc_curve))
+  
+  # optimal probability threshold
+  thresholds <- seq(0.05, 0.95, by = 0.01)
+  f1_scores <- sapply(thresholds, function(t) {
+    pred_class <- factor(ifelse(predicted_prob >= t, "Yes", "No"),
+                         levels = c("No", "Yes"))
+    confmatrix <- caret::confusionMatrix(pred_class, test_data$CANCEREV,
+                                 positive = "Yes", mode = "everything")
+    f1 <- confmatrix$byClass["F1"]
+    ifelse(is.na(f1), 0, f1)
+  })
+  best_threshold <- thresholds[which.max(f1_scores)]
+  
+  # confusion matrix at best threshold
+  pred_class <- factor(ifelse(predicted_prob >= best_threshold, "Yes", "No"),
+                       levels = c("No", "Yes"))
+  confmatrix <- caret::confusionMatrix(pred_class, test_data$CANCEREV,
+                               positive = "Yes", mode = "everything")
+  
+  list(
+    name       = model_name,
+    threshold  = best_threshold,
+    accuracy   = unname(confmatrix$overall["Accuracy"]),
+    precision  = unname(confmatrix$byClass["Precision"]),
+    recall     = unname(confmatrix$byClass["Recall"]),
+    f1         = unname(confmatrix$byClass["F1"]),
+    auc        = auc_value,
+    confusion  = confmatrix$table,
+    roc        = roc_curve,
+    predicted_prob  = predicted_prob
+  )
+}
+```
+
+```{r}
+# Evaulating three kernals
+
+results_linear <- evaluate_svm(svm_linear, test_df, "Linear")
+results_radial <- evaluate_svm(svm_radial, test_df, "Radial (RBF)")
+results_poly   <- evaluate_svm(svm_poly,   test_df, "Polynomial")
+```
+
+```{r}
+# Comparison 
+results_table <- data.frame(
+  Model     = c(results_linear$name, results_radial$name, results_poly$name),
+  Threshold = round(c(results_linear$threshold, results_radial$threshold, results_poly$threshold), 2),
+  Accuracy  = round(c(results_linear$accuracy,  results_radial$accuracy,  results_poly$accuracy),  3),
+  Precision = round(c(results_linear$precision, results_radial$precision, results_poly$precision), 3),
+  Recall    = round(c(results_linear$recall,    results_radial$recall,    results_poly$recall),    3),
+  F1        = round(c(results_linear$f1,        results_radial$f1,        results_poly$f1),        3),
+  ROC_AUC   = round(c(results_linear$auc,       results_radial$auc,       results_poly$auc),       3)
+)
+
+print(results_table)
+results_table$Model <- c("Linear SVM", "Radial (RBF) SVM", "Polynomial SVM")
+print(results_table)
+```
+
+All three kernels perform similarly with AUC around 0.77-0.78, with radial slightly ahead. The recall is around 70% across kernels, which means the model catches about 7 out of 10 cancer cases, but precision is low which is ~27% because of the low base rate of cancer in the data. The confusion matrices below show this in raw counts.
+
+```{r}
+# Confusion matrices
+cat("\n Linear SVM confusion matrix \n")
+print(results_linear$confusion)
+cat("\n Radial SVM confusion matrix \n")
+print(results_radial$confusion)
+cat("\n Polynomial SVM confusion matrix \n")
+print(results_poly$confusion)
+```
+
+```{r}
+# Combining ROC curves 
+roc_data <- rbind(
+  data.frame(FPR = 1 - results_linear$roc$specificities,
+             TPR = results_linear$roc$sensitivities,
+             Model = "Linear"),
+  data.frame(FPR = 1 - results_radial$roc$specificities,
+             TPR = results_radial$roc$sensitivities,
+             Model = "Radial (RBF)"),
+  data.frame(FPR = 1 - results_poly$roc$specificities,
+             TPR = results_poly$roc$sensitivities,
+             Model = "Polynomial")
+)
+
+# AUC labels 
+auc_labels <- paste0(c("Linear", "Radial (RBF)", "Polynomial"),
+                     " (AUC = ",
+                     round(c(results_linear$auc, results_radial$auc, results_poly$auc), 3),
+                     ")")
+roc_data$Model <- factor(roc_data$Model,
+                         levels = c("Linear", "Radial (RBF)", "Polynomial"),
+                         labels = auc_labels)
+
+roc_plot <- ggplot(roc_data, aes(x = FPR, y = TPR, color = Model)) +
+  geom_line(size = 1.1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey60") +
+  labs(title    = "ROC Curves: SVM Kernels for Cancer Prediction",
+       subtitle = "Test set performance, n = 1,199",
+       x        = "False Positive Rate (1 - Specificity)",
+       y        = "True Positive Rate (Sensitivity)",
+       color    = NULL) +
+  scale_color_manual(values = c("#1f77b4", "#d62728", "#2ca02c")) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = c(0.65, 0.2),
+        legend.background = element_rect(fill = "white", color = "grey80"))
+
+print(roc_plot)
+
+ggsave("roc_curves.png", roc_plot, width = 8, height = 6, dpi = 300)
+```
+
+```{r}
+# confusion matrix heatmap
+make_cm_plot <- function(cm_table, title) {
+  cm_df <- as.data.frame(cm_table)
+  ggplot(cm_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = Freq), color = "white", size = 6, fontface = "bold") +
+    scale_fill_gradient(low = "#9ecae1", high = "#08306b") +
+    labs(title = title, x = "Actual", y = "Predicted") +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "none",
+          plot.title = element_text(hjust = 0.5, face = "bold"))
+}
+
+cm_plot_linear <- make_cm_plot(results_linear$confusion, "Linear SVM")
+cm_plot_radial <- make_cm_plot(results_radial$confusion, "Radial (RBF) SVM")
+cm_plot_poly   <- make_cm_plot(results_poly$confusion,   "Polynomial SVM")
+
+cm_combined <- gridExtra::grid.arrange(cm_plot_linear, cm_plot_radial, cm_plot_poly,
+                                       nrow = 1)
+
+ggsave("confusion_matrices.png", cm_combined, width = 12, height = 4, dpi = 300)
+```
+
+```{r}
+# Permutation importance
+
+permutation_importance <- function(model, data, target_col = "CANCEREV") {
+  base_pred <- predict(model, data, type = "prob")[, "Yes"]
+  base_auc <- as.numeric(pROC::auc(pROC::roc(data[[target_col]], base_pred,
+                                             levels = c("No", "Yes"), quiet = TRUE)))
+  
+  features <- setdiff(names(data), target_col)
+  importance <- numeric(length(features))
+  names(importance) <- features
+  
+  for (f in features) {
+    permuted <- data
+    permuted[[f]] <- sample(permuted[[f]])  # shuffle this column
+    new_pred <- predict(model, permuted, type = "prob")[, "Yes"]
+    new_auc <- as.numeric(pROC::auc(pROC::roc(permuted[[target_col]], new_pred,
+                                              levels = c("No", "Yes"), quiet = TRUE)))
+    importance[f] <- base_auc - new_auc
+  }
+  importance
+}
+
+set.seed(2025)
+imp_radial <- permutation_importance(svm_radial, test_df)
+
+imp_df <- data.frame(Variable   = names(imp_radial),
+                     Importance = as.numeric(imp_radial))
+imp_df <- imp_df[order(-imp_df$Importance), ]
+readable_vars <- c(
+  AGE       = "Age",
+  SEX       = "Sex",
+  POVERTY   = "Income-to-poverty ratio",
+  BMICALC   = "BMI",
+  MOD10DMIN = "Moderate exercise (min)",
+  HRSLEEP   = "Sleep (hrs/night)",
+  ALCDAYSYR = "Alcohol days/year",
+  FRUTNO    = "Fruit servings/week"
+)
+imp_df$Variable <- readable_vars[as.character(imp_df$Variable)]
+
+importance_plot <- ggplot(imp_df,
+                          aes(x = reorder(Variable, Importance),
+                              y = Importance)) +
+  geom_col(fill = "#d62728") +
+  coord_flip() +
+  labs(title    = "Permutation Variable Importance (Radial SVM)",
+       subtitle = "Drop in test AUC when each variable is shuffled",
+       x = NULL, y = "AUC drop") +
+  theme_minimal(base_size = 13)
+
+print(importance_plot)
+ggsave("variable_importance.png", importance_plot, width = 8, height = 5, dpi = 300)
+
+print(imp_df)
+```
+
+```{r}
+# Stop the parallel cluster
+stopCluster(cl)
+registerDoSEQ()
+```
+
+## Summary
+
+Across all three kernels, the test AUC is around 0.78 and the differences between kernels are small. The permutation importance results show that AGE alone drives almost all of the predictive signal with every other variable contributing very little. This explains why the more flexible radial and polynomial kernels do not beat the linear kernel by much. The full discussion of these results, including limitations and implications is in the poster.
